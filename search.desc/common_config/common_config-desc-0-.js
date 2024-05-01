@@ -1,0 +1,1 @@
+searchState.loadedDescShard("common_config", 0, "Returns the argument unchanged.\nCalls <code>U::from(self)</code>.\nGet the CPU core number of system, aware of cgroups.\nGet the total memory of the system. If <code>cgroup_limits</code> is …")

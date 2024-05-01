@@ -1,0 +1,1 @@
+searchState.loadedDescShard("nyc_taxi", 0, "Use the taxi trip records from New York City dataset to …\nBatch size of insert request.\nReturns the argument unchanged.\nCalls <code>U::from(self)</code>.\nNumber of query iteration\nPath to the dataset\nNumber of client threads on write (parallel on file level)")

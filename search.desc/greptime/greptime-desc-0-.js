@@ -1,0 +1,1 @@
+searchState.loadedDescShard("greptime", 0, "Introduction\nReturns the argument unchanged.\nCalls <code>U::from(self)</code>.\n<code>ToString::to_string</code>, but without panic on OOM.")
