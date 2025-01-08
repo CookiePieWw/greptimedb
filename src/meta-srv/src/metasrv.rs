@@ -447,6 +447,7 @@ impl Metasrv {
                             let res = election.register_candidate(&node_info).await;
                             if let Err(e) = res {
                                 warn!(e; "Metasrv register candidate error");
+                                continue;
                             }
                             break;
                         }
@@ -459,7 +460,6 @@ impl Metasrv {
                             if let Err(e) = res {
                                 warn!(e; "Metasrv keep lease error");
                             }
-                            break;
                         }
                     }
                 });
