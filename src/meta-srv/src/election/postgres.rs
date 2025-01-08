@@ -652,7 +652,8 @@ mod tests {
     use tokio_postgres::{Client, NoTls};
 
     use super::*;
-    use crate::{election::CANDIDATE_KEEP_ALIVE_INTERVAL_SECS, error::PostgresExecutionSnafu};
+    use crate::election::CANDIDATE_KEEP_ALIVE_INTERVAL_SECS;
+    use crate::error::PostgresExecutionSnafu;
     const CREATE_TABLE: &str =
         "CREATE TABLE IF NOT EXISTS greptime_metakv(k bytea PRIMARY KEY, v bytea);";
 
