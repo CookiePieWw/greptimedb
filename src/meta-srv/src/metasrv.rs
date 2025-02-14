@@ -151,9 +151,13 @@ pub struct MetasrvOptions {
     #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
     /// Table name of rds kv backend.
     pub meta_table_name: String,
-    #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
+    #[cfg(feature = "pg_kvbackend")]
     /// Lock id for meta kv election. Only effect when using pg_kvbackend.
     pub meta_election_lock_id: u64,
+    #[cfg(feature = "mysql_kvbackend")]
+    pub meta_election_sql: String,
+    #[cfg(feature = "mysql_kvbackend")]
+    pub meta_step_down_sql: String,
 }
 
 const DEFAULT_METASRV_ADDR_PORT: &str = "3002";
@@ -193,8 +197,12 @@ impl Default for MetasrvOptions {
             backend: BackendImpl::EtcdStore,
             #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
             meta_table_name: DEFAULT_META_TABLE_NAME.to_string(),
-            #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
+            #[cfg(feature = "pg_kvbackend")]
             meta_election_lock_id: DEFAULT_META_ELECTION_LOCK_ID,
+            #[cfg(feature = "mysql_kvbackend")]
+            meta_election_sql: "SELECT GET_LOCK('__greptime_meta_kv_lock__', 0)".to_string(),
+            #[cfg(feature = "mysql_kvbackend")]
+            meta_step_down_sql: "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__')".to_string(),
         }
     }
 }

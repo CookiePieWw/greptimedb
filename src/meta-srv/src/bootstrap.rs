@@ -267,7 +267,8 @@ pub async fn metasrv_builder(
                 opts.store_key_prefix.clone(),
                 CANDIDATE_LEASE_SECS,
                 &opts.meta_table_name,
-                opts.meta_election_lock_id,
+                &opts.meta_election_sql,
+                &opts.meta_step_down_sql,
             )
             .await?;
             (kv_backend, Some(election))

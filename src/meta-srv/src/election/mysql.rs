@@ -40,8 +40,9 @@ use crate::metasrv::{ElectionRef, LeaderValue, MetasrvNodeInfo};
 const LEASE_SEP: &str = r#"||__metadata_lease_sep||"#;
 
 struct ElectionSqlFactory<'a> {
-    lock_id: u64,
     table_name: &'a str,
+    election_sql: &'a str,
+    step_down_sql: &'a str,
 }
 
 struct ElectionSqlSet {
@@ -90,10 +91,11 @@ struct ElectionSqlSet {
 }
 
 impl<'a> ElectionSqlFactory<'a> {
-    fn new(lock_id: u64, table_name: &'a str) -> Self {
+    fn new(table_name: &'a str, election_sql: &'a str, step_down_sql: &'a str) -> Self {
         Self {
-            lock_id,
             table_name,
+            election_sql,
+            step_down_sql,
         }
     }
 
@@ -116,11 +118,11 @@ impl<'a> ElectionSqlFactory<'a> {
     }
 
     fn campaign_sql(&self) -> String {
-        format!("SELECT GET_LOCK('{}', 1024)", self.lock_id)
+        self.election_sql.to_string()
     }
 
     fn step_down_sql(&self) -> String {
-        format!("SELECT RELEASE_LOCK('{}')", self.lock_id)
+        self.step_down_sql.to_string()
     }
 
     fn put_value_with_lease_sql(&self) -> String {
@@ -235,9 +237,10 @@ impl MySqlElection {
         store_key_prefix: String,
         candidate_lease_ttl_secs: u64,
         table_name: &str,
-        lock_id: u64,
+        election_sql: &str,
+        step_down_sql: &str,
     ) -> Result<ElectionRef> {
-        let sql_factory = ElectionSqlFactory::new(lock_id, table_name);
+        let sql_factory = ElectionSqlFactory::new(table_name, election_sql, step_down_sql);
         // Set idle session timeout to IDLE_SESSION_TIMEOUT to avoid dead advisory lock.
         sqlx::query(sql_factory.set_idle_session_timeout_sql())
             .execute(&mut client)
@@ -779,7 +782,12 @@ mod tests {
             leader_watcher: tx,
             store_key_prefix: uuid,
             candidate_lease_ttl_secs: 10,
-            sql_set: ElectionSqlFactory::new(28319, table_name).build(),
+            sql_set: ElectionSqlFactory::new(
+                table_name,
+                "SELECT GET_LOCK('__greptime_meta_kv_lock__1', 0)",
+                "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__1')",
+            )
+            .build(),
         };
 
         let res = mysql_election
@@ -859,7 +867,12 @@ mod tests {
             leader_watcher: tx,
             store_key_prefix,
             candidate_lease_ttl_secs,
-            sql_set: ElectionSqlFactory::new(28319, &table_name).build(),
+            sql_set: ElectionSqlFactory::new(
+                &table_name,
+                "SELECT GET_LOCK('__greptime_meta_kv_lock__2', 0)",
+                "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__2')",
+            )
+            .build(),
         };
 
         let node_info = MetasrvNodeInfo {
@@ -903,7 +916,12 @@ mod tests {
             leader_watcher: tx,
             store_key_prefix: uuid.clone(),
             candidate_lease_ttl_secs,
-            sql_set: ElectionSqlFactory::new(28319, table_name).build(),
+            sql_set: ElectionSqlFactory::new(
+                table_name,
+                "SELECT GET_LOCK('__greptime_meta_kv_lock__3', 0)",
+                "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__3')",
+            )
+            .build(),
         };
 
         let candidates = mysql_election.all_candidates().await.unwrap();
@@ -945,7 +963,12 @@ mod tests {
             leader_watcher: tx,
             store_key_prefix: uuid,
             candidate_lease_ttl_secs,
-            sql_set: ElectionSqlFactory::new(28320, table_name).build(),
+            sql_set: ElectionSqlFactory::new(
+                table_name,
+                "SELECT GET_LOCK('__greptime_meta_kv_lock__4', 0)",
+                "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__4')",
+            )
+            .build(),
         };
 
         leader_mysql_election.elected().await.unwrap();
@@ -1060,7 +1083,12 @@ mod tests {
             leader_watcher: tx,
             store_key_prefix: uuid,
             candidate_lease_ttl_secs,
-            sql_set: ElectionSqlFactory::new(28321, table_name).build(),
+            sql_set: ElectionSqlFactory::new(
+                table_name,
+                "SELECT GET_LOCK('__greptime_meta_kv_lock__5', 0)",
+                "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__5')",
+            )
+            .build(),
         };
 
         // Step 1: No leader exists, campaign and elected.
@@ -1273,7 +1301,12 @@ mod tests {
             leader_watcher: tx,
             store_key_prefix: uuid.clone(),
             candidate_lease_ttl_secs,
-            sql_set: ElectionSqlFactory::new(28322, table_name).build(),
+            sql_set: ElectionSqlFactory::new(
+                table_name,
+                "SELECT GET_LOCK('__greptime_meta_kv_lock__6', 0)",
+                "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__6')",
+            )
+            .build(),
         };
 
         let leader_client = create_mysql_client(Some(table_name)).await.unwrap();
@@ -1286,7 +1319,12 @@ mod tests {
             leader_watcher: tx,
             store_key_prefix: uuid,
             candidate_lease_ttl_secs,
-            sql_set: ElectionSqlFactory::new(28322, table_name).build(),
+            sql_set: ElectionSqlFactory::new(
+                table_name,
+                "SELECT GET_LOCK('__greptime_meta_kv_lock__6', 0)",
+                "SELECT RELEASE_LOCK('__greptime_meta_kv_lock__6')",
+            )
+            .build(),
         };
 
         let query = sqlx::query(&leader_mysql_election.sql_set.campaign);
