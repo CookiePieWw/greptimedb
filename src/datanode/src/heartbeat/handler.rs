@@ -28,6 +28,7 @@ mod close_region;
 mod downgrade_region;
 mod open_region;
 mod upgrade_region;
+mod flush_region;
 
 use super::task_tracker::TaskTracker;
 use crate::region_server::RegionServer;
@@ -94,7 +95,9 @@ impl RegionHeartbeatResponseHandler {
                 handler_context.handle_upgrade_region_instruction(upgrade_region)
             })),
             Instruction::InvalidateCaches(_) => InvalidHeartbeatResponseSnafu.fail(),
-            Instruction::FlushRegion(_) => InvalidHeartbeatResponseSnafu.fail(),
+            Instruction::FlushRegion(flush_region) => Ok(Box::new(move |handler_context| {
+                handler_context.handle_flush_region_instruction(flush_region)
+            })),
         }
     }
 }
