@@ -12,16 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+
 use api::v1::meta::mailbox_message::Payload;
 use api::v1::meta::{HeartbeatResponse, MailboxMessage};
 use common_meta::instruction::{
     DowngradeRegionReply, InstructionReply, SimpleReply, UpgradeRegionReply,
 };
+use common_meta::key::table_route::TableRouteValue;
+use common_meta::key::test_utils::new_test_table_info;
+use common_meta::key::TableMetadataManagerRef;
+use common_meta::kv_backend::ResettableKvBackendRef;
+use common_meta::peer::Peer;
+use common_meta::rpc::router::{Region, RegionRoute};
 use common_meta::sequence::Sequence;
 use common_time::util::current_time_millis;
+use store_api::storage::RegionId;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::error::Result;
+use crate::handler::remote_wal_entryid_handler::update_in_memory_region_last_entry_id;
 use crate::handler::{HeartbeatMailbox, Pusher, Pushers};
 use crate::service::mailbox::{Channel, MailboxRef};
 
@@ -155,4 +165,73 @@ pub fn new_upgrade_region_reply(
             .unwrap(),
         )),
     }
+}
+
+pub async fn new_wal_prune_metadata(
+    table_metadata_manager: TableMetadataManagerRef,
+    in_memory: ResettableKvBackendRef,
+    region_n: u32,
+    table_n: u32,
+    threshold: u64,
+    topic: String,
+) -> (Option<u64>, Vec<RegionId>) {
+    let from_peer = Peer::empty(1);
+    let mut min_last_entry_id = 0;
+    let mut region_entry_ids = HashMap::with_capacity(table_n as usize * region_n as usize);
+    for table_id in 0..table_n {
+        let region_ids = (0..region_n)
+            .map(|i| RegionId::new(table_id, i))
+            .collect::<Vec<_>>();
+        let table_info = new_test_table_info(table_id, 0..region_n).into();
+        let region_routes = region_ids
+            .iter()
+            .map(|region_id| RegionRoute {
+                region: Region::new_test(*region_id),
+                leader_peer: Some(from_peer.clone()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let region_wal_options: HashMap<u32, String> = (0..region_n)
+            .map(|region_number| (region_number, topic.clone()))
+            .collect();
+
+        table_metadata_manager
+            .create_table_metadata(
+                table_info,
+                TableRouteValue::physical(region_routes),
+                region_wal_options.clone(),
+            )
+            .await
+            .unwrap();
+
+        let current_region_entry_ids = region_ids
+            .iter()
+            .map(|region_id| {
+                let current_last_entry_id = rand::random::<u64>();
+                min_last_entry_id = min_last_entry_id.min(current_last_entry_id);
+                (region_id.as_u64(), current_last_entry_id)
+            })
+            .collect::<HashMap<_, _>>();
+        region_entry_ids.extend(current_region_entry_ids.clone());
+        update_in_memory_region_last_entry_id(&in_memory, current_region_entry_ids)
+            .await
+            .unwrap();
+    }
+
+    let regions_to_flush = region_entry_ids
+        .iter()
+        .filter_map(|(region_id, last_entry_id)| {
+            if last_entry_id - min_last_entry_id > threshold {
+                Some(RegionId::from_u64(*region_id))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let min_last_entry_id = if min_last_entry_id == 0 {
+        None
+    } else {
+        Some(min_last_entry_id)
+    };
+    (min_last_entry_id, regions_to_flush)
 }

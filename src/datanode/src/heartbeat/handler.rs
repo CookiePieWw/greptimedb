@@ -26,9 +26,9 @@ use store_api::storage::RegionId;
 
 mod close_region;
 mod downgrade_region;
+mod flush_region;
 mod open_region;
 mod upgrade_region;
-mod flush_region;
 
 use super::task_tracker::TaskTracker;
 use crate::region_server::RegionServer;

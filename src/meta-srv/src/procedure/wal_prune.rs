@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use common_error::ext::BoxedError;
 use common_meta::distributed_time_constants::MAILBOX_RTT_SECS;
 use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
 use common_meta::key::TableMetadataManagerRef;
+use common_meta::kv_backend::ResettableKvBackendRef;
 use common_meta::lock_key::RemoteWalLock;
 use common_meta::peer::Peer;
 use common_meta::RegionIdent;
@@ -38,6 +40,7 @@ use store_api::logstore::EntryId;
 use store_api::storage::RegionId;
 
 use crate::error::{self, BuildPartitionClientSnafu, DeleteRecordSnafu, TableMetadataManagerSnafu};
+use crate::handler::remote_wal_entryid_handler::REMOTE_WAL_LAST_ENTRY_ID_KEY;
 use crate::handler::HeartbeatMailbox;
 use crate::service::mailbox::{Channel, MailboxRef};
 use crate::Result;
@@ -60,6 +63,7 @@ pub struct Context {
     client: KafkaClientRef,
     /// The table metadata manager.
     table_metadata_manager: TableMetadataManagerRef,
+    in_memory: ResettableKvBackendRef,
     server_addr: String,
     mailbox: MailboxRef,
 }
@@ -67,13 +71,13 @@ pub struct Context {
 /// The data of WAL pruning.
 #[derive(Serialize, Deserialize)]
 pub struct WalPruneData {
-    /// The topic names to prune.
-    pub topics: Vec<String>,
+    /// The topic name to prune.
+    pub topic: String,
     // Threshold to judge if we need to send flush request.
     // None means no need to flush.
     pub threshold: Option<u64>,
     /// The last entry id for each topic.
-    pub last_entry_ids_to_prune: Option<Vec<Option<EntryId>>>,
+    pub last_entry_id_to_prune: Option<EntryId>,
     /// The regions needed to be flushed.
     pub regions_to_flush: Option<Vec<RegionId>>,
     /// The state.
@@ -89,12 +93,12 @@ pub struct WalPruneProcedure {
 impl WalPruneProcedure {
     const TYPE_NAME: &'static str = "metasrv-procedure::WalPrune";
 
-    pub fn new(topics: Vec<String>, threshold: Option<u64>, context: Context) -> Self {
+    pub fn new(topic: String, threshold: Option<u64>, context: Context) -> Self {
         Self {
             data: WalPruneData {
-                topics,
+                topic,
                 threshold,
-                last_entry_ids_to_prune: None,
+                last_entry_id_to_prune: None,
                 regions_to_flush: None,
                 state: WalPruneState::Prepare,
             },
@@ -147,74 +151,74 @@ impl WalPruneProcedure {
     /// Retry:
     /// - Failed to retrieve any metadata.
     pub async fn on_prepare(&mut self) -> Result<Status> {
-        let topic_region_map = self
+        let region_ids = self
             .context
             .table_metadata_manager
             .topic_region_manager()
-            .get_regions_by_topics(&self.data.topics)
+            .regions(&self.data.topic)
             .await
             .context(TableMetadataManagerSnafu)
             .map_err(BoxedError::new)
             .with_context(|_| error::RetryLaterWithSourceSnafu {
                 reason: "Failed to get topic-region map",
             })?;
-        let regions = topic_region_map
-            .values()
-            .flatten()
-            .copied()
-            .collect::<Vec<RegionId>>();
-        let last_entry_ids_map = self
+        let kv = self
             .context
-            .table_metadata_manager
-            .topic_region_manager()
-            .get_region_last_entry_ids(regions)
-            .await;
+            .in_memory
+            .get(REMOTE_WAL_LAST_ENTRY_ID_KEY.as_bytes())
+            .await
+            .context(error::KvBackendSnafu)
+            .unwrap_or_default();
+        let last_entry_ids_map: HashMap<RegionId, EntryId> = if let Some(kv) = kv {
+            serde_json::from_slice(kv.value()).context(error::DeserializeFromJsonSnafu {
+                input: String::from_utf8_lossy(kv.value()),
+            })?
+        } else {
+            // Should not happenning since we will submit the procedure after several heartbeat epochs.
+            // If it happens, the procedure will do nothing based on the empty map.
+            warn!("No remote WAL entry IDs in memory store");
+            return Ok(Status::done());
+        };
 
         let mut regions_to_flush = Vec::new();
         // Map last entry id to each topic
-        let mut last_entry_ids = Vec::with_capacity(self.data.topics.len());
-        for topic in &self.data.topics {
-            // Safety: the topic must exist in the map.
-            let region_ids = topic_region_map.get(topic).unwrap();
-            // `None` means no region for the topic.
-            if region_ids.is_empty() {
-                last_entry_ids.push(None);
-                continue;
-            }
-            let mut min_last_entry_id = 0;
-            let mut max_last_entry_id = 0;
+        let mut last_entry_id = None;
+        // `None` means no region for the topic.
+        if region_ids.is_empty() {
+            last_entry_id = None;
+        }
+        let mut min_last_entry_id = 0;
+        let mut max_last_entry_id = 0;
 
-            // Find the smallest and largest last entry id.
+        // Find the smallest and largest last entry id.
+        for region_id in region_ids.iter() {
+            let current_entry_id = last_entry_ids_map.get(region_id).copied();
+            if let Some(current_entry_id) = current_entry_id {
+                // We should use the `smallest last entry - 1` id to prune.
+                min_last_entry_id = min_last_entry_id.min(current_entry_id - 1);
+                // Used to judge if we need to flush the region.
+                max_last_entry_id = max_last_entry_id.max(current_entry_id);
+            }
+        }
+        // Zero means no need to prune.
+        if min_last_entry_id != 0 {
+            // Prune at the min last entry id.
+            last_entry_id = Some(min_last_entry_id);
+        }
+
+        // We need to send flush request to stale regions.
+        if let Some(threshold) = self.data.threshold {
             for region_id in region_ids {
-                let last_entry_id = last_entry_ids_map.get(region_id).copied();
+                let last_entry_id = last_entry_ids_map.get(&region_id).copied();
                 if let Some(last_entry_id) = last_entry_id {
-                    // We should use the `smallest last entry - 1` id to prune.
-                    min_last_entry_id = min_last_entry_id.min(last_entry_id - 1);
-                    // Used to judge if we need to flush the region.
-                    max_last_entry_id = max_last_entry_id.max(last_entry_id);
-                }
-            }
-            // Zero means no need to prune.
-            if min_last_entry_id == 0 {
-                last_entry_ids.push(None);
-            } else {
-                last_entry_ids.push(Some(min_last_entry_id));
-            }
-
-            // We need to send flush request to the stale region.
-            if let Some(threshold) = self.data.threshold {
-                for region_id in region_ids {
-                    let last_entry_id = last_entry_ids_map.get(region_id).copied();
-                    if let Some(last_entry_id) = last_entry_id {
-                        if max_last_entry_id - last_entry_id > threshold {
-                            regions_to_flush.push(*region_id);
-                        }
+                    if max_last_entry_id - last_entry_id > threshold {
+                        regions_to_flush.push(region_id);
                     }
                 }
             }
         }
 
-        self.data.last_entry_ids_to_prune = Some(last_entry_ids);
+        self.data.last_entry_id_to_prune = last_entry_id;
         self.data.regions_to_flush = Some(regions_to_flush);
         self.data.state = WalPruneState::SendFlushRequest;
         Ok(Status::executing(true))
@@ -274,32 +278,29 @@ impl WalPruneProcedure {
     /// Prune the WAL.
     pub async fn on_prune(&mut self) -> Result<Status> {
         // Safety: last_entry_ids are loaded in on_prepare.
-        for (topic, last_entry_id_to_prune) in self
-            .data
-            .topics
-            .iter()
-            .zip(self.data.last_entry_ids_to_prune.as_ref().unwrap())
-        {
-            if let Some(last_entry_id_to_prune) = last_entry_id_to_prune {
-                let partition_client = self
-                    .context
-                    .client
-                    .partition_client(topic, DEFAULT_PARTITION, UnknownTopicHandling::Retry)
-                    .await
-                    .context(BuildPartitionClientSnafu {
-                        topic,
-                        partition: DEFAULT_PARTITION,
-                    })?;
+        if let Some(last_entry_id_to_prune) = self.data.last_entry_id_to_prune {
+            let partition_client = self
+                .context
+                .client
+                .partition_client(
+                    self.data.topic.clone(),
+                    DEFAULT_PARTITION,
+                    UnknownTopicHandling::Retry,
+                )
+                .await
+                .context(BuildPartitionClientSnafu {
+                    topic: self.data.topic.clone(),
+                    partition: DEFAULT_PARTITION,
+                })?;
 
-                partition_client
-                    .delete_records((*last_entry_id_to_prune) as i64, DELETE_RECORDS_TIMEOUT)
-                    .await
-                    .context(DeleteRecordSnafu {
-                        topic,
-                        partition: DEFAULT_PARTITION,
-                        offset: *last_entry_id_to_prune,
-                    })?;
-            }
+            partition_client
+                .delete_records(last_entry_id_to_prune as i64, DELETE_RECORDS_TIMEOUT)
+                .await
+                .context(DeleteRecordSnafu {
+                    topic: self.data.topic.clone(),
+                    partition: DEFAULT_PARTITION,
+                    offset: last_entry_id_to_prune,
+                })?;
         }
         Ok(Status::done())
     }
@@ -352,11 +353,9 @@ impl Procedure for WalPruneProcedure {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::assert_matches::assert_matches;
 
-    use common_meta::key::table_route::TableRouteValue;
-    use common_meta::key::test_utils::new_test_table_info;
-    use common_meta::rpc::router::{Region, RegionRoute};
+    use common_meta::kv_backend::memory::MemoryKvBackend;
     use common_meta::wal_options_allocator::build_kafka_topic_creator;
     use common_wal::config::kafka::common::{KafkaConnectionConfig, KafkaTopicConfig};
     use common_wal::config::kafka::MetasrvKafkaConfig;
@@ -364,46 +363,18 @@ mod tests {
 
     use super::*;
     use crate::procedure::region_migration::test_util::TestingEnv;
+    use crate::procedure::test_util::new_wal_prune_metadata;
 
-    async fn mock_prepared_data(
+    /// Mock a test env for testing.
+    /// Including:
+    /// 1. Create a test env with a mailbox, a table metadata manager and a in-memory kv backend.
+    /// 2. Prepare some data in the table metadata manager and in-memory kv backend.
+    /// 3. Generate a `WalPruneProcedure` with the test env.
+    /// 4. Return the test env, the procedure, the minimum last entry id to prune and the regions to flush.
+    async fn mock_test_env(
         broker_endpoints: Vec<String>,
-        region_ids: &[RegionId],
-    ) -> (TestingEnv, WalPruneProcedure) {
-        let from_peer = Peer::empty(1);
-        let data = WalPruneData {
-            topics: vec!["topic1".to_string(), "topic2".to_string()],
-            threshold: Some(1),
-            last_entry_ids_to_prune: Some(vec![Some(1), Some(2)]),
-            regions_to_flush: Some(vec![RegionId::new(1, 1), RegionId::new(1, 2)]),
-            state: WalPruneState::SendFlushRequest,
-        };
-
+    ) -> (TestingEnv, WalPruneProcedure, Option<u64>, Vec<RegionId>) {
         let mut env = TestingEnv::new();
-
-        let table_info = new_test_table_info(1, vec![1, 2]).into();
-        let region_routes = region_ids
-            .iter()
-            .map(|region_id| RegionRoute {
-                region: Region::new_test(*region_id),
-                leader_peer: Some(from_peer.clone()),
-                follower_peers: vec![],
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-
-        env.table_metadata_manager()
-            .create_table_metadata(
-                table_info,
-                TableRouteValue::physical(region_routes),
-                HashMap::default(),
-            )
-            .await
-            .unwrap();
-
-        let topics = (0..1)
-            .map(|i| format!("test_alloc_topics_{}_{}", i, uuid::Uuid::new_v4()))
-            .collect::<Vec<_>>();
-
         // Creates a topic manager.
         let kafka_topic = KafkaTopicConfig {
             replication_factor: broker_endpoints.len() as i16,
@@ -419,17 +390,35 @@ mod tests {
         };
         let topic_creator = build_kafka_topic_creator(&config).await.unwrap();
         let table_metadata_manager = env.table_metadata_manager().clone();
+        let in_memory = Arc::new(MemoryKvBackend::new());
         let mailbox_ctx = env.mailbox_context();
+
+        let topic = "test_topic".to_string();
+        let (min_last_entry_id, regions_to_flush) = new_wal_prune_metadata(
+            table_metadata_manager.clone(),
+            in_memory.clone(),
+            10,
+            5,
+            10,
+            topic.clone(),
+        )
+        .await;
 
         let context = Context {
             client: topic_creator.client().clone(),
             table_metadata_manager,
+            in_memory,
             server_addr: "mock_server_addr".to_string(),
             mailbox: mailbox_ctx.mailbox().clone(),
         };
-        let mut procedure = WalPruneProcedure::new(topics, Some(1), context);
-        procedure.data = data;
-        (env, procedure)
+
+        let wal_prune_procedure = WalPruneProcedure::new(topic, Some(5), context);
+        (
+            env,
+            wal_prune_procedure,
+            min_last_entry_id,
+            regions_to_flush,
+        )
     }
 
     fn mock_flush_reply(
@@ -457,13 +446,18 @@ mod tests {
         run_test_with_kafka_wal(|broker_endpoints| {
             Box::pin(async {
                 common_telemetry::init_default_ut_logging();
-                // Since we haven't implement the logic in kvbackend yet, we only test `on_sending_flush_request` and `on_prune` here.
-                // Manually set the states.
-                // TODO(CookiePie): Add more tests after implementing the heartbeat part.
                 let region_ids = vec![RegionId::new(1, 1), RegionId::new(1, 2)];
-                let (mut env, mut procedure) =
-                    mock_prepared_data(broker_endpoints, &region_ids).await;
+                let (mut env, mut procedure, min_last_entry_id, regions_to_flush) =
+                    mock_test_env(broker_endpoints).await;
 
+                // Step 1: Test `on_prepare`.
+                let status = procedure.on_prepare().await.unwrap();
+                assert_matches!(status, Status::Executing { persist: true });
+                assert_matches!(procedure.data.state, WalPruneState::SendFlushRequest);
+                assert_eq!(procedure.data.last_entry_id_to_prune, min_last_entry_id,);
+                assert_eq!(procedure.data.regions_to_flush, Some(regions_to_flush));
+
+                // Step 2: Test `on_sending_flush_request`.
                 let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
                 env.mailbox_context()

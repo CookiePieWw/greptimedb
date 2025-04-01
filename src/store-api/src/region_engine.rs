@@ -32,7 +32,7 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::logstore::entry;
+use crate::logstore::{entry, EntryId};
 use crate::metadata::RegionMetadataRef;
 use crate::region_request::{
     BatchRegionDdlRequest, RegionOpenRequest, RegionRequest, RegionSequencesRequest,
@@ -372,6 +372,8 @@ pub struct RegionStatistic {
     /// The size of SST index files in bytes.
     #[serde(default)]
     pub index_size: u64,
+    /// The last entry id of wal if using remote wal.
+    pub last_entry_id: Option<EntryId>,
 }
 
 impl RegionStatistic {

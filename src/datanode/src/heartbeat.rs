@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use api::v1::meta::{HeartbeatRequest, NodeInfo, Peer, RegionRole, RegionStat};
 use common_meta::cache_invalidator::CacheInvalidatorRef;
-use common_meta::datanode::REGION_STATISTIC_KEY;
+use common_meta::datanode::{REGION_STATISTIC_KEY, REGION_STATISTIC_LAST_ENTRY_ID_KEY};
 use common_meta::distributed_time_constants::META_KEEP_ALIVE_INTERVAL_SECS;
 use common_meta::heartbeat::handler::invalidate_table_cache::InvalidateCacheHandler;
 use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
@@ -337,9 +337,16 @@ impl HeartbeatTask {
                     .region_statistic(stat.region_id)
                     .unwrap_or_default();
                 let mut extensions = HashMap::new();
+                let approximate_bytes = region_stat.estimated_disk_size() as i64;
                 if let Some(serialized) = region_stat.serialize_to_vec() {
                     extensions.insert(REGION_STATISTIC_KEY.to_string(), serialized);
                 }
+                if let Some(last_entry_id) = region_stat.last_entry_id {
+                    extensions.insert(
+                        REGION_STATISTIC_LAST_ENTRY_ID_KEY.to_string(),
+                        last_entry_id.to_string().into_bytes(),
+                    );
+                };
 
                 RegionStat {
                     region_id: stat.region_id.as_u64(),
@@ -348,7 +355,7 @@ impl HeartbeatTask {
                     // TODO(weny): w/rcus
                     rcus: 0,
                     wcus: 0,
-                    approximate_bytes: region_stat.estimated_disk_size() as i64,
+                    approximate_bytes,
                     extensions,
                 }
             })

@@ -290,6 +290,11 @@ impl MitoRegion {
         let manifest_usage = self.stats.total_manifest_size();
         let num_rows = version.ssts.num_rows() + version.memtables.num_rows();
 
+        let last_entry_id = match &self.provider {
+            Provider::Kafka(_) => Some(version.flushed_entry_id),
+            _ => None,
+        };
+
         RegionStatistic {
             num_rows,
             memtable_size: memtable_usage,
@@ -297,6 +302,7 @@ impl MitoRegion {
             manifest_size: manifest_usage,
             sst_size: sst_usage,
             index_size: index_usage,
+            last_entry_id,
         }
     }
 
