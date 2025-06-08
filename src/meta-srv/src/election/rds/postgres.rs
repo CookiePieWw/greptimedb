@@ -117,6 +117,15 @@ impl<'a> ElectionSqlFactory<'a> {
         )
     }
 
+    // Same as `set_idle_session_timeout_sql`, but for idle in transaction timeout.
+    // Though with `idle_session_timeout` set, the session will not be closed if it is in an open transaction.
+    fn set_idle_in_transaction_timeout_sql(&self) -> String {
+        format!(
+            "SET idle_in_transaction_session_timeout = '{}s';",
+            self.meta_lease_ttl_secs + 1
+        )
+    }
+
     fn campaign_sql(&self) -> String {
         format!("SELECT pg_try_advisory_lock({})", self.lock_id)
     }
@@ -198,6 +207,10 @@ impl PgElection {
         // Set idle session timeout to IDLE_SESSION_TIMEOUT to avoid dead advisory lock.
         client
             .execute(&sql_factory.set_idle_session_timeout_sql(), &[])
+            .await
+            .context(PostgresExecutionSnafu)?;
+        client
+            .execute(&sql_factory.set_idle_in_transaction_timeout_sql(), &[])
             .await
             .context(PostgresExecutionSnafu)?;
 
